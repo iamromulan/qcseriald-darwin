@@ -163,6 +163,87 @@ Any serial tool (screen, minicom, qfenix, etc.)
 
 Single C file, no third-party dependencies. Links against IOKit, CoreFoundation, and libutil.
 
+## Known Issues
+
+### SIP (System Integrity Protection) and `/dev/` Symlinks
+
+The daemon creates friendly symlinks like `/dev/tty.qcserial-at0` pointing to the real PTY device (e.g., `/dev/ttys042`). On macOS with SIP enabled (the default), `/dev/` is a `devfs` mount with increasing restrictions in newer macOS versions.
+
+The daemon handles this automatically with a fallback strategy:
+
+1. **Try `/dev/` first** — On startup, a test symlink is created in `/dev/`. If it succeeds, all port symlinks use `/dev/` as usual.
+2. **Fall back to `~/dev/`** — If `/dev/` symlinks are blocked by SIP, the daemon creates symlinks in the real user's home directory under `~/dev/` (e.g., `/Users/you/dev/tty.qcserial-at0`). This directory is auto-created if needed and owned by the real user (resolved from `SUDO_USER`).
+
+Check `sudo qcseriald log` to see which directory was selected — the log will show either `Symlink directory: /dev (native)` or `Symlink directory: /Users/you/dev (fallback)`.
+
+If using the `~/dev/` fallback, point serial tools at the full path:
+```bash
+screen ~/dev/tty.qcserial-at0 115200
+```
+
+### `launchctl setenv` Restrictions
+
+The daemon runs `launchctl setenv ADB_LIBUSB 0` at startup to work around an ADB bug with non-contiguous USB interface numbers. On macOS 14+ with SIP enabled, `launchctl` environment manipulation may be restricted. If this fails, ADB (not the daemon) may have issues connecting to the modem. This only matters if you use ADB alongside the serial bridge.
+
+**Workaround:** Set the variable manually in your shell profile:
+```bash
+echo 'export ADB_LIBUSB=0' >> ~/.zshrc
+```
+
+### Gatekeeper Quarantine
+
+If you download a pre-built binary from GitHub, macOS will quarantine it and Gatekeeper will block execution. This is separate from SIP. Fix by removing the quarantine flag or building from source:
+
+```bash
+# Remove quarantine from downloaded binary
+xattr -d com.apple.quarantine qcseriald
+
+# Or just build from source (recommended)
+make
+```
+
+## Disabling SIP
+
+> **Warning:** Disabling SIP reduces macOS system security. Only do this if you understand the implications and need full `/dev/` symlink support or are troubleshooting daemon issues. For most users, the daemon works fine with SIP enabled.
+
+SIP can only be disabled from macOS Recovery Mode:
+
+### Intel Macs
+
+1. Restart your Mac and hold **Command (⌘) + R** during boot until the Apple logo appears
+2. Once in Recovery Mode, open **Utilities → Terminal** from the menu bar
+3. Run:
+   ```bash
+   csrutil disable
+   ```
+4. Restart your Mac
+
+### Apple Silicon Macs (M1/M2/M3/M4)
+
+1. Shut down your Mac completely
+2. Press and hold the **power button** until you see "Loading startup options..."
+3. Click **Options**, then click **Continue**
+4. If prompted, select a user and enter their password
+5. From the menu bar, open **Utilities → Terminal**
+6. Run:
+   ```bash
+   csrutil disable
+   ```
+7. When prompted, enter your admin password and confirm
+8. Restart your Mac
+
+### Verify SIP Status
+
+```bash
+csrutil status
+# "System Integrity Protection status: enabled." = SIP is on (default)
+# "System Integrity Protection status: disabled." = SIP is off
+```
+
+### Re-enabling SIP
+
+Follow the same steps above but run `csrutil enable` instead. It is recommended to re-enable SIP when you no longer need it disabled.
+
 ## License
 
 MIT License. See [LICENSE](LICENSE).

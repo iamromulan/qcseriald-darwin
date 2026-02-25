@@ -27,6 +27,7 @@
 #include <termios.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <fcntl.h>
 #include <glob.h>
 #include <stdatomic.h>
@@ -41,7 +42,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.0"
+#define QCSERIALD_VERSION "1.0.1"
 #define QCSERIALD_AUTHOR  "iamromulan"
 #define QCSERIALD_URL     "https://github.com/iamromulan/qcseriald-darwin"
 
@@ -168,9 +169,11 @@ static int get_diag_iface(uint16_t vid, uint16_t pid) {
     return 0;  /* default: interface 0 */
 }
 
-#define PID_FILE      "/var/run/qcseriald.pid"
-#define STATUS_FILE   "/var/run/qcseriald.status"
-#define LOG_FILE      "/var/log/qcseriald.log"
+#define PID_FILE        "/var/run/qcseriald.pid"
+#define STATUS_FILE     "/var/run/qcseriald.status"
+#define LOG_FILE        "/var/log/qcseriald.log"
+#define SYMLINK_PREFIX  "tty.qcserial-"
+#define DEV_DIR         "/dev"
 
 /* ── Bridge states ── */
 
@@ -208,6 +211,8 @@ static int g_bridge_count = 0;
 
 static pthread_mutex_t g_exit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_exit_cond  = PTHREAD_COND_INITIALIZER;
+
+static char g_symlink_dir[512] = DEV_DIR;
 
 
 /* ── Signal handler ── */
@@ -259,20 +264,91 @@ static const char *vendor_name(int vid) {
     return NULL;
 }
 
+/* ── Symlink directory resolution ── */
+
+static void resolve_symlink_dir(void) {
+    /* Probe /dev/ with a test symlink */
+    const char *test_link = DEV_DIR "/" SYMLINK_PREFIX "test";
+    if (symlink("/dev/null", test_link) == 0) {
+        unlink(test_link);
+        snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s", DEV_DIR);
+        printf("Symlink directory: %s (native)\n", g_symlink_dir);
+        return;
+    }
+
+    /* /dev/ symlinks failed — fall back to ~/dev/ */
+    const char *home = NULL;
+    const char *sudo_user = getenv("SUDO_USER");
+    if (sudo_user) {
+        struct passwd *pw = getpwnam(sudo_user);
+        if (pw)
+            home = pw->pw_dir;
+    }
+    if (!home) {
+        const char *logname = getenv("LOGNAME");
+        if (logname) {
+            struct passwd *pw = getpwnam(logname);
+            if (pw)
+                home = pw->pw_dir;
+        }
+    }
+    if (!home)
+        home = "/var/root";
+
+    snprintf(g_symlink_dir, sizeof(g_symlink_dir), "%s/dev", home);
+
+    /* Create ~/dev/ if it doesn't exist */
+    struct stat st;
+    if (stat(g_symlink_dir, &st) != 0) {
+        if (mkdir(g_symlink_dir, 0755) == 0) {
+            /* chown to real user if running via sudo */
+            if (sudo_user) {
+                struct passwd *pw = getpwnam(sudo_user);
+                if (pw)
+                    chown(g_symlink_dir, pw->pw_uid, pw->pw_gid);
+            }
+            printf("Created fallback symlink directory: %s\n", g_symlink_dir);
+        } else {
+            fprintf(stderr, C_YELLOW "Warning: could not create %s: %s\n" C_RESET,
+                    g_symlink_dir, strerror(errno));
+        }
+    }
+
+    printf("Symlink directory: %s (fallback — /dev/ symlinks blocked by SIP)\n", g_symlink_dir);
+}
+
+static void make_symlink_path(char *buf, size_t size, const char *name) {
+    snprintf(buf, size, "%s/" SYMLINK_PREFIX "%s", g_symlink_dir, name);
+}
+
 /* ── Stale symlink cleanup ── */
 
 static void cleanup_stale_symlinks(void) {
-    glob_t gl;
-    if (glob("/dev/tty.qcserial-*", 0, NULL, &gl) == 0) {
-        for (size_t i = 0; i < gl.gl_pathc; i++) {
-            struct stat st;
-            /* If the symlink target doesn't exist, it's stale */
-            if (stat(gl.gl_pathv[i], &st) != 0) {
-                printf("Removing stale symlink: %s\n", gl.gl_pathv[i]);
-                unlink(gl.gl_pathv[i]);
+    /* Glob both /dev/ and the resolved g_symlink_dir (may be ~/dev/).
+     * Previous sessions may have used a different directory. */
+    const char *patterns[2];
+    char alt_pattern[600];
+    int n = 0;
+
+    patterns[n++] = DEV_DIR "/" SYMLINK_PREFIX "*";
+    if (strcmp(g_symlink_dir, DEV_DIR) != 0) {
+        snprintf(alt_pattern, sizeof(alt_pattern), "%s/" SYMLINK_PREFIX "*", g_symlink_dir);
+        patterns[n++] = alt_pattern;
+    }
+
+    for (int p = 0; p < n; p++) {
+        glob_t gl;
+        if (glob(patterns[p], 0, NULL, &gl) == 0) {
+            for (size_t i = 0; i < gl.gl_pathc; i++) {
+                struct stat st;
+                /* If the symlink target doesn't exist, it's stale */
+                if (stat(gl.gl_pathv[i], &st) != 0) {
+                    printf("Removing stale symlink: %s\n", gl.gl_pathv[i]);
+                    unlink(gl.gl_pathv[i]);
+                }
             }
+            globfree(&gl);
         }
-        globfree(&gl);
     }
 }
 
@@ -646,7 +722,7 @@ static int setup_bridges(void) {
 
         /* Create a symlink with a friendly name */
         char link[256];
-        snprintf(link, sizeof(link), "/dev/tty.qcserial-%s", func);
+        make_symlink_path(link, sizeof(link), func);
         unlink(link);
         if (symlink(slave_name, link) < 0) {
             fprintf(stderr, "Warning: symlink %s -> %s failed: %s\n",
@@ -711,7 +787,7 @@ static void write_status_file(void);
 
 static void rename_bridge(bridge_t *b, const char *new_name) {
     char new_link[256];
-    snprintf(new_link, sizeof(new_link), "/dev/tty.qcserial-%s", new_name);
+    make_symlink_path(new_link, sizeof(new_link), new_name);
 
     if (strcmp(b->link_name, new_link) == 0)
         return;  /* already named correctly */
@@ -724,7 +800,7 @@ static void rename_bridge(bridge_t *b, const char *new_name) {
         return;
     }
 
-    printf("  Identified: %s -> /dev/tty.qcserial-%s\n", b->func_name, new_name);
+    printf("  Identified: %s -> %s/" SYMLINK_PREFIX "%s\n", b->func_name, g_symlink_dir, new_name);
     strncpy(b->link_name, new_link, sizeof(b->link_name) - 1);
     strncpy(b->func_name, new_name, sizeof(b->func_name) - 1);
 }
@@ -1226,6 +1302,7 @@ static int cmd_start(int foreground) {
         printf("Cleaning up stale PID file (PID %d no longer running)\n", existing);
         pid_file_remove();
     }
+    resolve_symlink_dir();
     cleanup_stale_symlinks();
 
     /* Set ADB_LIBUSB=0 system-wide so adb uses the native macOS backend.

@@ -1,0 +1,111 @@
+name: Build and Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # macOS ARM64 (Apple Silicon)
+  build-macos-arm64:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          make CFLAGS="-std=c11 -Wall -O2 -arch arm64" \
+               LDFLAGS="-arch arm64 -framework IOKit -framework CoreFoundation -lutil"
+
+          echo "=== Verify build ==="
+          file qcseriald
+          echo "=== Dynamic dependencies (should only be system libs) ==="
+          otool -L qcseriald
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: qcseriald
+
+  # macOS x64 (Intel)
+  build-macos-x64:
+    runs-on: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Build
+        run: |
+          make CFLAGS="-std=c11 -Wall -O2 -arch x86_64" \
+               LDFLAGS="-arch x86_64 -framework IOKit -framework CoreFoundation -lutil"
+
+          echo "=== Verify build ==="
+          file qcseriald
+          echo "=== Dynamic dependencies (should only be system libs) ==="
+          otool -L qcseriald
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-x64
+          path: qcseriald
+
+  # Create universal binary and release
+  create-release:
+    needs: [build-macos-arm64, build-macos-x64]
+    runs-on: macos-14
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create universal binary and release archives
+        run: |
+          # Create universal (fat) binary from both architectures
+          lipo -create artifacts/macos-arm64/qcseriald artifacts/macos-x64/qcseriald \
+               -output artifacts/qcseriald-universal
+          echo "=== Verify universal binary ==="
+          file artifacts/qcseriald-universal
+          lipo -info artifacts/qcseriald-universal
+
+          cd artifacts
+
+          # ARM64
+          cd macos-arm64
+          chmod +x qcseriald
+          tar -czvf ../qcseriald-macos-arm64.tar.gz qcseriald
+          cd ..
+
+          # x64
+          cd macos-x64
+          chmod +x qcseriald
+          tar -czvf ../qcseriald-macos-x64.tar.gz qcseriald
+          cd ..
+
+          # Universal
+          chmod +x qcseriald-universal
+          mv qcseriald-universal qcseriald
+          tar -czvf qcseriald-macos-universal.tar.gz qcseriald
+
+          ls -la *.tar.gz
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            artifacts/qcseriald-macos-arm64.tar.gz
+            artifacts/qcseriald-macos-x64.tar.gz
+            artifacts/qcseriald-macos-universal.tar.gz
+          draft: false
+          prerelease: true
