@@ -42,7 +42,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.1"
+#define QCSERIALD_VERSION "1.0.2"
 #define QCSERIALD_AUTHOR  "iamromulan"
 #define QCSERIALD_URL     "https://github.com/iamromulan/qcseriald-darwin"
 
@@ -1286,6 +1286,63 @@ static void run_monitor_loop(void) {
     }
 }
 
+/* ── ADB_LIBUSB=0 environment setup ── */
+
+static int check_launchctl_env(void)
+{
+	FILE *fp = popen("launchctl getenv ADB_LIBUSB 2>/dev/null", "r");
+	if (!fp)
+		return 0;
+	char buf[32] = {0};
+	if (fgets(buf, sizeof(buf), fp))
+		buf[strcspn(buf, "\n")] = '\0';
+	pclose(fp);
+	return (strcmp(buf, "0") == 0);
+}
+
+static void set_adb_libusb_env(void)
+{
+	/* Set ADB_LIBUSB=0 so adb uses the native macOS backend.
+	 * ADB 34+ defaults to libusb which has a bug with non-contiguous USB
+	 * interface numbers (e.g. 0,1,2,3,5 — no 4) causing LIBUSB_ERROR_NOT_FOUND.
+	 *
+	 * On macOS 14+ with SIP enabled, system-wide launchctl setenv may be
+	 * restricted. Fall back to user-domain launchctl, then warn. */
+
+	/* Try system-wide (works when SIP allows it) */
+	system("launchctl setenv ADB_LIBUSB 0 2>/dev/null");
+	if (check_launchctl_env()) {
+		printf("ADB_LIBUSB=0 set (system-wide via launchctl)\n");
+		return;
+	}
+
+	/* System-wide failed — try user domain via real user's UID */
+	uid_t target_uid = getuid();
+	const char *sudo_user = getenv("SUDO_USER");
+	if (sudo_user) {
+		struct passwd *pw = getpwnam(sudo_user);
+		if (pw)
+			target_uid = pw->pw_uid;
+	}
+
+	char cmd[256];
+	snprintf(cmd, sizeof(cmd),
+		 "launchctl asuser %u launchctl setenv ADB_LIBUSB 0 2>/dev/null",
+		 target_uid);
+	system(cmd);
+
+	if (check_launchctl_env()) {
+		printf("ADB_LIBUSB=0 set (user domain via launchctl)\n");
+		return;
+	}
+
+	/* Both failed — set in our own process env and warn */
+	setenv("ADB_LIBUSB", "0", 1);
+	fprintf(stderr, C_YELLOW "Warning: could not set ADB_LIBUSB=0 via launchctl (SIP restriction)\n" C_RESET);
+	fprintf(stderr, C_YELLOW "ADB may have issues with this modem. To fix permanently, add to ~/.zshrc:\n" C_RESET);
+	fprintf(stderr, C_YELLOW "  export ADB_LIBUSB=0\n" C_RESET);
+}
+
 /* ── cmd_start ── */
 
 static int cmd_start(int foreground) {
@@ -1305,10 +1362,7 @@ static int cmd_start(int foreground) {
     resolve_symlink_dir();
     cleanup_stale_symlinks();
 
-    /* Set ADB_LIBUSB=0 system-wide so adb uses the native macOS backend.
-     * ADB 34+ defaults to libusb which has a bug with non-contiguous USB
-     * interface numbers (e.g. 0,1,2,3,5 — no 4) causing LIBUSB_ERROR_NOT_FOUND. */
-    system("launchctl setenv ADB_LIBUSB 0");
+    set_adb_libusb_env();
 
     if (foreground) {
         /* Run in foreground (for launchd or manual debugging) */
