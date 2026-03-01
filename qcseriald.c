@@ -1508,6 +1508,7 @@ static int cmd_start(int foreground) {
 /* ── cmd_stop ── */
 
 static int cmd_stop(void) {
+    resolve_symlink_dir();
     pid_t pid = pid_file_read();
     if (!pid || !is_process_alive(pid)) {
         printf(C_YELLOW "qcseriald is not running\n" C_RESET);
