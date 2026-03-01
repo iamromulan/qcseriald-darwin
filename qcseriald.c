@@ -42,7 +42,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.2"
+#define QCSERIALD_VERSION "1.0.3"
 #define QCSERIALD_AUTHOR  "iamromulan"
 #define QCSERIALD_URL     "https://github.com/iamromulan/qcseriald-darwin"
 
