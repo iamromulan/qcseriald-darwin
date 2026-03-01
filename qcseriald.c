@@ -30,6 +30,7 @@
 #include <pwd.h>
 #include <fcntl.h>
 #include <glob.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <time.h>
 #include <poll.h>
@@ -53,6 +54,26 @@
 #define C_YELLOW "\033[33m"
 #define C_GREEN  "\033[38;5;121m"
 #define C_BOLD   "\033[1m"
+
+/* ── Timestamped logging ── */
+
+static int g_log_timestamps;  /* set to 1 when running as daemon */
+
+__attribute__((format(printf, 1, 2)))
+static void logprintf(const char *fmt, ...) {
+    if (g_log_timestamps) {
+        time_t now = time(NULL);
+        struct tm tm;
+        localtime_r(&now, &tm);
+        printf("[%04d-%02d-%02d %02d:%02d:%02d] ",
+               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+               tm.tm_hour, tm.tm_min, tm.tm_sec);
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    vprintf(fmt, ap);
+    va_end(ap);
+}
 
 /* ── Constants ── */
 
@@ -360,37 +381,45 @@ static void *usb_to_pty(void *arg) {
     UInt8 buf[USB_BUF_SIZE];
     IOReturn kr;
     UInt32 len;
-    int not_responding_count = 0;
+    time_t last_good_read = time(NULL);
 
     atomic_store(&b->usb_to_pty_alive, 1);
-    printf("[%s] USB->PTY thread started\n", b->func_name);
+    logprintf("[%s] USB->PTY thread started\n", b->func_name);
 
     while (atomic_load(&g_running) && atomic_load(&b->state) == BRIDGE_RUNNING) {
         len = sizeof(buf);
         kr = (*b->iface)->ReadPipe(b->iface, b->pipe_in, buf, &len);
         if (kr != kIOReturnSuccess) {
             if (kr == kIOReturnAborted) {
-                printf("[%s] USB->PTY ReadPipe: 0x%x (stopping)\n", b->func_name, kr);
+                logprintf("[%s] USB->PTY ReadPipe: 0x%x (stopping)\n", b->func_name, kr);
                 break;
             }
-            if (kr == kIOReturnNotResponding ||
-                kr == (IOReturn)0xe00002eb) {  /* kIOUSBPipeStalled */
-                /* Transient USB hiccup — clear stall and retry */
+            if (kr == kIOReturnNotResponding) {
+                /* Transient during AT port probing — retry with timeout.
+                 * Genuine disconnect if it persists for 30+ seconds. */
                 (*b->iface)->ClearPipeStall(b->iface, b->pipe_in);
-                not_responding_count++;
-                if (not_responding_count > 50) {  /* ~5s of continuous failure */
-                    printf("[%s] USB->PTY: device unresponsive after %d retries, giving up\n",
-                           b->func_name, not_responding_count);
+                if (time(NULL) - last_good_read > 30) {
+                    logprintf("[%s] USB->PTY: not responding for 30s, giving up\n",
+                             b->func_name);
                     break;
                 }
-                usleep(100000);  /* 100ms */
+                usleep(10000);  /* 10ms */
                 continue;
             }
-            fprintf(stderr, "[%s] USB->PTY ReadPipe error: 0x%x\n", b->func_name, kr);
+            if (kr == (IOReturn)0xe00002c0 ||   /* kIOReturnNotOpen */
+                kr == (IOReturn)0xe00002eb) {   /* kIOUSBPipeStalled */
+                /* Common after USB re-enumeration recovery — pipe may
+                 * take a while to become functional. Retry indefinitely
+                 * (monitor loop handles real disconnect detection). */
+                (*b->iface)->ClearPipeStall(b->iface, b->pipe_in);
+                usleep(10000);  /* 10ms */
+                continue;
+            }
+            logprintf("[%s] USB->PTY ReadPipe error: 0x%x\n", b->func_name, kr);
             usleep(10000);
             continue;
         }
-        not_responding_count = 0;  /* Reset on successful read */
+        last_good_read = time(NULL);
         if (len > 0) {
             ssize_t written = 0;
             while (written < (ssize_t)len) {
@@ -401,18 +430,18 @@ static void *usb_to_pty(void *arg) {
                         /* No slave open yet — discard this data and continue */
                         break;
                     }
-                    fprintf(stderr, "[%s] USB->PTY write error: %s\n", b->func_name, strerror(errno));
+                    logprintf("[%s] USB->PTY write error: %s\n", b->func_name, strerror(errno));
                     goto done;
                 }
                 written += n;
             }
         }
     }
-    printf("[%s] USB->PTY loop ended (running=%d state=%d)\n",
-           b->func_name, atomic_load(&g_running), atomic_load(&b->state));
+    logprintf("[%s] USB->PTY loop ended (running=%d state=%d)\n",
+              b->func_name, atomic_load(&g_running), atomic_load(&b->state));
 done:
     atomic_store(&b->usb_to_pty_alive, 0);
-    printf("[%s] USB->PTY thread exiting\n", b->func_name);
+    logprintf("[%s] USB->PTY thread exiting\n", b->func_name);
 
     pthread_mutex_lock(&g_exit_mutex);
     pthread_cond_signal(&g_exit_cond);
@@ -429,7 +458,7 @@ static void *pty_to_usb(void *arg) {
     IOReturn kr;
 
     atomic_store(&b->pty_to_usb_alive, 1);
-    printf("[%s] PTY->USB thread started\n", b->func_name);
+    logprintf("[%s] PTY->USB thread started\n", b->func_name);
 
     /* Use non-blocking reads with poll so we can check g_running frequently */
     int flags = fcntl(b->pty_master, F_GETFL, 0);
@@ -465,12 +494,12 @@ static void *pty_to_usb(void *arg) {
         if (kr != kIOReturnSuccess) {
             if (kr == kIOReturnAborted || kr == kIOReturnNotResponding)
                 break;
-            fprintf(stderr, "[%s] WritePipe error: 0x%x\n", b->func_name, kr);
+            logprintf("[%s] WritePipe error: 0x%x\n", b->func_name, kr);
         }
     }
 
     atomic_store(&b->pty_to_usb_alive, 0);
-    printf("[%s] PTY->USB thread exiting\n", b->func_name);
+    logprintf("[%s] PTY->USB thread exiting\n", b->func_name);
 
     pthread_mutex_lock(&g_exit_mutex);
     pthread_cond_signal(&g_exit_cond);
@@ -496,7 +525,7 @@ static int attempt_usb_recovery(io_service_t device_service) {
             kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
             &plug, &score);
     if (kr != kIOReturnSuccess || !plug) {
-        fprintf(stderr, "Recovery: failed to create device plugin: 0x%x\n", kr);
+        logprintf("Recovery: failed to create device plugin: 0x%x\n", kr);
         return -1;
     }
 
@@ -505,7 +534,7 @@ static int attempt_usb_recovery(io_service_t device_service) {
             (LPVOID *)&dev);
     (*plug)->Release(plug);
     if (!dev) {
-        fprintf(stderr, "Recovery: failed to get device interface\n");
+        logprintf("Recovery: failed to get device interface\n");
         return -1;
     }
 
@@ -513,25 +542,25 @@ static int attempt_usb_recovery(io_service_t device_service) {
      * our normal path never does USBDeviceOpen(). */
     kr = (*dev)->USBDeviceOpenSeize(dev);
     if (kr != kIOReturnSuccess) {
-        fprintf(stderr, "Recovery: USBDeviceOpenSeize failed: 0x%x\n", kr);
+        logprintf("Recovery: USBDeviceOpenSeize failed: 0x%x\n", kr);
         (*dev)->Release(dev);
         return -1;
     }
 
     /* Re-enumerate: terminates all clients, simulates unplug/replug */
-    printf("Recovery: triggering USB re-enumeration to clear stale locks...\n");
+    logprintf("Recovery: triggering USB re-enumeration to clear stale locks...\n");
     kr = (*dev)->USBDeviceReEnumerate(dev, 0);
 
     (*dev)->USBDeviceClose(dev);
     (*dev)->Release(dev);
 
     if (kr != kIOReturnSuccess) {
-        fprintf(stderr, "Recovery: USBDeviceReEnumerate failed: 0x%x\n", kr);
+        logprintf("Recovery: USBDeviceReEnumerate failed: 0x%x\n", kr);
         return -1;
     }
 
     /* Wait for re-enumeration to complete — device disappears and re-appears */
-    printf("Recovery: waiting for USB re-enumeration (3s)...\n");
+    logprintf("Recovery: waiting for USB re-enumeration (3s)...\n");
     sleep(3);
     return 0;
 }
@@ -542,14 +571,14 @@ static int setup_bridges(void) {
     /* Find the USB device — match all IOUSBHostDevice, filter VID manually */
     CFMutableDictionaryRef match = IOServiceMatching("IOUSBHostDevice");
     if (!match) {
-        fprintf(stderr, "Failed to create matching dict\n");
+        logprintf("Failed to create matching dict\n");
         return -1;
     }
 
     io_iterator_t dev_iter;
     IOReturn kr = IOServiceGetMatchingServices(kIOMainPortDefault, match, &dev_iter);
     if (kr != kIOReturnSuccess) {
-        fprintf(stderr, "IOServiceGetMatchingServices failed: 0x%x\n", kr);
+        logprintf("IOServiceGetMatchingServices failed: 0x%x\n", kr);
         return -1;
     }
 
@@ -586,7 +615,7 @@ static int setup_bridges(void) {
         return -1;  /* No modem found — caller will retry */
     }
 
-    printf("Matched vendor: %s (VID 0x%04x PID 0x%04x)\n", matched_vendor, matched_vid, matched_pid);
+    logprintf("Matched vendor: %s (VID 0x%04x PID 0x%04x)\n", matched_vendor, matched_vid, matched_pid);
 
     /* Get product name */
     CFStringRef product = IORegistryEntryCreateCFProperty(device, CFSTR("USB Product Name"),
@@ -594,7 +623,7 @@ static int setup_bridges(void) {
     if (product) {
         char name[128];
         CFStringGetCString(product, name, sizeof(name), kCFStringEncodingUTF8);
-        printf("Found: %s\n", name);
+        logprintf("Found: %s\n", name);
         CFRelease(product);
     }
 
@@ -607,7 +636,7 @@ static int setup_bridges(void) {
     kr = IORegistryEntryCreateIterator(device, kIOServicePlane,
                                         kIORegistryIterateRecursively, &child_iter);
     if (kr != kIOReturnSuccess) {
-        fprintf(stderr, "Failed to create child iterator: 0x%x\n", kr);
+        logprintf("Failed to create child iterator: 0x%x\n", kr);
         IOObjectRelease(device);
         return -1;
     }
@@ -655,7 +684,7 @@ static int setup_bridges(void) {
 
         /* Skip ADB interface (subclass 0x42, protocol 0x01) */
         if (iface_subclass == 0x42 && iface_protocol == 0x01) {
-            printf("Skipping ADB interface %d (use 'adb devices' directly)\n", iface_num);
+            logprintf("Skipping ADB interface %d (use 'adb devices' directly)\n", iface_num);
             (*iface)->Release(iface);
             continue;
         }
@@ -664,7 +693,7 @@ static int setup_bridges(void) {
         if (kr != kIOReturnSuccess) {
             if (kr == (IOReturn)0xe00002c5)  /* kIOReturnExclusiveAccess */
                 exclusive_access_hit = 1;
-            fprintf(stderr, "Failed to open interface %d: 0x%x\n", iface_num, kr);
+            logprintf("Failed to open interface %d: 0x%x\n", iface_num, kr);
             (*iface)->Release(iface);
             continue;
         }
@@ -688,7 +717,7 @@ static int setup_bridges(void) {
         }
 
         if (pipe_in == 0 || pipe_out == 0) {
-            printf("Interface %d: no bulk IN/OUT pair, skipping\n", iface_num);
+            logprintf("Interface %d: no bulk IN/OUT pair, skipping\n", iface_num);
             (*iface)->USBInterfaceClose(iface);
             (*iface)->Release(iface);
             continue;
@@ -736,8 +765,8 @@ static int setup_bridges(void) {
         make_symlink_path(link, sizeof(link), func);
         unlink(link);
         if (symlink(slave_name, link) < 0) {
-            fprintf(stderr, "Warning: symlink %s -> %s failed: %s\n",
-                    link, slave_name, strerror(errno));
+            logprintf("Warning: symlink %s -> %s failed: %s\n",
+                      link, slave_name, strerror(errno));
             snprintf(link, sizeof(link), "%s", slave_name);
         }
 
@@ -755,9 +784,9 @@ static int setup_bridges(void) {
         atomic_store(&b->usb_to_pty_alive, 0);
         atomic_store(&b->pty_to_usb_alive, 0);
 
-        printf("Interface %d (%s): %s -> %s\n", iface_num, func, slave_name, link);
-        printf("  Bulk IN pipe %d, Bulk OUT pipe %d, %d endpoints\n",
-               pipe_in, pipe_out, num_endpoints);
+        logprintf("Interface %d (%s): %s -> %s\n", iface_num, func, slave_name, link);
+        logprintf("  Bulk IN pipe %d, Bulk OUT pipe %d, %d endpoints\n",
+                  pipe_in, pipe_out, num_endpoints);
 
         /* Create threads as detached */
         pthread_attr_t attr;
@@ -774,19 +803,22 @@ static int setup_bridges(void) {
 
     /* If we got exclusive access errors and opened zero bridges, attempt recovery */
     if (g_bridge_count == 0 && exclusive_access_hit) {
-        printf("Exclusive access conflict — attempting USB re-enumeration recovery...\n");
+        logprintf("Exclusive access conflict — attempting USB re-enumeration recovery...\n");
         if (attempt_usb_recovery(device) == 0) {
             IOObjectRelease(device);
             /* Retry from scratch after re-enumeration */
             return setup_bridges();
         }
-        fprintf(stderr, "Recovery failed — modem unplug/replug may be required\n");
+        logprintf("Recovery failed — modem unplug/replug may be required\n");
     }
 
     IOObjectRelease(device);
 
-    if (g_bridge_count == 0)
+    if (g_bridge_count == 0) {
+        if (matched_vendor)
+            logprintf("Device found but no interfaces opened\n");
         return -1;
+    }
 
     return 0;
 }
@@ -806,12 +838,12 @@ static void rename_bridge(bridge_t *b, const char *new_name) {
     unlink(b->link_name);
     unlink(new_link);
     if (symlink(b->pty_name, new_link) < 0) {
-        fprintf(stderr, "Warning: symlink %s -> %s failed: %s\n",
-                new_link, b->pty_name, strerror(errno));
+        logprintf("Warning: symlink %s -> %s failed: %s\n",
+                  new_link, b->pty_name, strerror(errno));
         return;
     }
 
-    printf("  Identified: %s -> %s/" SYMLINK_PREFIX "%s\n", b->func_name, g_symlink_dir, new_name);
+    logprintf("  Identified: %s -> %s/" SYMLINK_PREFIX "%s\n", b->func_name, g_symlink_dir, new_name);
     strncpy(b->link_name, new_link, sizeof(b->link_name) - 1);
     strncpy(b->func_name, new_name, sizeof(b->func_name) - 1);
 }
@@ -842,8 +874,8 @@ static void probe_ports(void) {
 
         int fd = open(g_bridges[i].link_name, O_RDWR | O_NONBLOCK | O_NOCTTY);
         if (fd < 0) {
-            fprintf(stderr, "Probe: failed to open %s: %s\n",
-                    g_bridges[i].link_name, strerror(errno));
+            logprintf("Probe: failed to open %s: %s\n",
+                      g_bridges[i].link_name, strerror(errno));
             continue;
         }
 
@@ -869,7 +901,7 @@ static void probe_ports(void) {
      * Strategy: send AT\r on all ports simultaneously, then poll for responses.
      * If ANY port responds, the modem is ready — keep probing the rest.
      * If NO port responds, the modem isn't ready yet — move to Phase 2 (RDY wait). */
-    printf("Probing %d unknown port(s) — trying AT command...\n", count);
+    logprintf("Probing %d unknown port(s) — trying AT command...\n", count);
 
     /* Send AT on all unknown ports simultaneously */
     for (int i = 0; i < count; i++) {
@@ -919,14 +951,14 @@ static void probe_ports(void) {
                 strstr(accum[i], "RDY")) {
                 types[i] = PORT_AT;
                 any_responded = 1;
-                printf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
+                logprintf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
             }
             /* Check for NMEA data */
             else if (strstr(accum[i], "$G")) {
                 types[i] = PORT_NMEA;
                 any_responded = 1;
-                printf("  [%s] NMEA data detected — GPS port\n",
-                       g_bridges[idx[i]].func_name);
+                logprintf("  [%s] NMEA data detected — GPS port\n",
+                          g_bridges[idx[i]].func_name);
             }
         }
     }
@@ -938,7 +970,7 @@ static void probe_ports(void) {
             if (types[i] == PORT_UNKNOWN) unknown_remain++;
         }
         if (unknown_remain > 0 && atomic_load(&g_running)) {
-            printf("Retrying AT on %d remaining port(s)...\n", unknown_remain);
+            logprintf("Retrying AT on %d remaining port(s)...\n", unknown_remain);
             for (int i = 0; i < count; i++) {
                 if (types[i] != PORT_UNKNOWN) continue;
                 if (!atomic_load(&g_running)) break;
@@ -966,7 +998,7 @@ static void probe_ports(void) {
                 if (strstr(resp, "OK") || strstr(resp, "ERROR") ||
                     strstr(resp, "RDY")) {
                     types[i] = PORT_AT;
-                    printf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
+                    logprintf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
                 }
             }
         }
@@ -976,8 +1008,8 @@ static void probe_ports(void) {
     /* Phase 2: No port responded to AT — modem not ready yet.
      * Wait for RDY URC (up to PROBE_RDY_TIMEOUT seconds), then retry AT.
      * RDY on ANY port means modem is ready, so immediately AT-probe the rest. */
-    printf("No AT response — modem not ready, waiting for RDY URC (up to %ds)...\n",
-           PROBE_RDY_TIMEOUT);
+    logprintf("No AT response — modem not ready, waiting for RDY URC (up to %ds)...\n",
+              PROBE_RDY_TIMEOUT);
 
     time_t rdy_start = time(NULL);
     int modem_ready = 0;
@@ -1020,12 +1052,12 @@ static void probe_ports(void) {
             if (strstr(accum[i], "RDY")) {
                 types[i] = PORT_AT;
                 modem_ready = 1;
-                printf("  [%s] RDY URC — AT port (modem ready)\n",
-                       g_bridges[idx[i]].func_name);
+                logprintf("  [%s] RDY URC — AT port (modem ready)\n",
+                          g_bridges[idx[i]].func_name);
             } else if (strstr(accum[i], "$G")) {
                 types[i] = PORT_NMEA;
-                printf("  [%s] NMEA data — GPS port\n",
-                       g_bridges[idx[i]].func_name);
+                logprintf("  [%s] NMEA data — GPS port\n",
+                          g_bridges[idx[i]].func_name);
             }
         }
     }
@@ -1037,7 +1069,7 @@ static void probe_ports(void) {
             if (types[i] == PORT_UNKNOWN) unknown_remain++;
         }
         if (unknown_remain > 0 && atomic_load(&g_running)) {
-            printf("AT-probing %d remaining port(s)...\n", unknown_remain);
+            logprintf("AT-probing %d remaining port(s)...\n", unknown_remain);
             for (int i = 0; i < count; i++) {
                 if (types[i] != PORT_UNKNOWN) continue;
                 if (!atomic_load(&g_running)) break;
@@ -1065,9 +1097,9 @@ static void probe_ports(void) {
                 if (strstr(resp, "OK") || strstr(resp, "ERROR") ||
                     strstr(resp, "RDY")) {
                     types[i] = PORT_AT;
-                    printf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
+                    logprintf("  [%s] AT port detected\n", g_bridges[idx[i]].func_name);
                 } else {
-                    printf("  [%s] No response\n", g_bridges[idx[i]].func_name);
+                    logprintf("  [%s] No response\n", g_bridges[idx[i]].func_name);
                 }
             }
         }
@@ -1090,8 +1122,8 @@ done:
         for (int i = 0; i < count; i++) {
             if (types[i] == PORT_UNKNOWN) {
                 types[i] = PORT_NMEA;
-                printf("  [%s] Remaining port assumed NMEA/GPS\n",
-                       g_bridges[idx[i]].func_name);
+                logprintf("  [%s] Remaining port assumed NMEA/GPS\n",
+                          g_bridges[idx[i]].func_name);
                 break;
             }
         }
@@ -1135,7 +1167,7 @@ static void shutdown_bridges(void) {
     if (g_bridge_count == 0)
         return;
 
-    printf("Shutting down %d bridge(s)...\n", g_bridge_count);
+    logprintf("Shutting down %d bridge(s)...\n", g_bridge_count);
 
     /* 1. Set all bridges to STOPPING */
     for (int i = 0; i < g_bridge_count; i++) {
@@ -1181,14 +1213,14 @@ static void shutdown_bridges(void) {
 
         int rc = pthread_cond_timedwait(&g_exit_cond, &g_exit_mutex, &deadline);
         if (rc == ETIMEDOUT) {
-            fprintf(stderr, "Shutdown timeout — stuck threads:\n");
+            logprintf("Shutdown timeout — stuck threads:\n");
             for (int i = 0; i < g_bridge_count; i++) {
                 bridge_t *b = &g_bridges[i];
                 int u2p = atomic_load(&b->usb_to_pty_alive);
                 int p2u = atomic_load(&b->pty_to_usb_alive);
                 if (u2p || p2u)
-                    fprintf(stderr, "  [%s] usb_to_pty=%d pty_to_usb=%d\n",
-                            b->func_name, u2p, p2u);
+                    logprintf("  [%s] usb_to_pty=%d pty_to_usb=%d\n",
+                              b->func_name, u2p, p2u);
             }
             break;
         }
@@ -1211,7 +1243,7 @@ static void shutdown_bridges(void) {
     }
 
     g_bridge_count = 0;
-    printf("All bridges shut down\n");
+    logprintf("All bridges shut down\n");
 }
 
 /* ── Status file ── */
@@ -1255,7 +1287,7 @@ static void run_monitor_loop(void) {
         write_status_file();
 
         if (g_bridge_count > 0 && alive_count == 0) {
-            printf(C_YELLOW "All bridges dead — modem likely disconnected\n" C_RESET);
+            logprintf(C_YELLOW "All bridges dead — modem likely disconnected\n" C_RESET);
             if (g_bridge_count > prev_bridge_count)
                 prev_bridge_count = g_bridge_count;
             shutdown_bridges();
@@ -1263,7 +1295,7 @@ static void run_monitor_loop(void) {
             write_status_file();
 
             /* Enter rescan loop */
-            printf(C_YELLOW "Waiting for modem to reconnect...\n" C_RESET);
+            logprintf(C_YELLOW "Waiting for modem to reconnect...\n" C_RESET);
             int retries_with_partial = 0;
             while (atomic_load(&g_running)) {
                 /* Sleep interruptibly — check g_running each second */
@@ -1276,19 +1308,19 @@ static void run_monitor_loop(void) {
                     /* If we got fewer bridges than before, the modem may still
                      * be re-enumerating. Tear down and retry a few times. */
                     if (g_bridge_count < prev_bridge_count && retries_with_partial < 3) {
-                        printf(C_YELLOW "Partial reconnect (%d/%d bridges) — retrying...\n" C_RESET,
-                               g_bridge_count, prev_bridge_count);
+                        logprintf(C_YELLOW "Partial reconnect (%d/%d bridges) — retrying...\n" C_RESET,
+                                  g_bridge_count, prev_bridge_count);
                         shutdown_bridges();
                         retries_with_partial++;
                         continue;
                     }
                     probe_ports();
                     g_daemon_state = "running";
-                    printf(C_GREEN "Modem reconnected — %d bridge(s) active\n" C_RESET, g_bridge_count);
+                    logprintf(C_GREEN "Modem reconnected — %d bridge(s) active\n" C_RESET, g_bridge_count);
                     prev_bridge_count = g_bridge_count;
-                    printf("\n" C_BOLD "Active ports:" C_RESET "\n");
+                    logprintf("\n" C_BOLD "Active ports:" C_RESET "\n");
                     for (int i = 0; i < g_bridge_count; i++)
-                        printf("  " C_GREEN "%s" C_RESET "\n", g_bridges[i].link_name);
+                        logprintf("  " C_GREEN "%s" C_RESET "\n", g_bridges[i].link_name);
                     break;
                 }
             }
@@ -1459,8 +1491,8 @@ static int cmd_start(int foreground) {
         _exit(1);
     }
 
-    /* Redirect stdout/stderr to log file */
-    int logfd = open(LOG_FILE, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    /* Redirect stdout/stderr to log file (truncate — old logs are stale) */
+    int logfd = open(LOG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (logfd >= 0) {
         dup2(logfd, STDOUT_FILENO);
         dup2(logfd, STDERR_FILENO);
@@ -1468,6 +1500,7 @@ static int cmd_start(int foreground) {
     }
     setbuf(stdout, NULL);
     setbuf(stderr, NULL);
+    g_log_timestamps = 1;
 
     /* Close stdin */
     int devnull = open("/dev/null", O_RDONLY);
@@ -1479,8 +1512,8 @@ static int cmd_start(int foreground) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    printf(C_BOLD C_GREEN "qcseriald" C_RESET " v%s daemon starting (PID %d)\n", QCSERIALD_VERSION, getpid());
-    printf("Looking for supported modem (%zu vendors)...\n", NUM_VENDORS);
+    logprintf(C_BOLD C_GREEN "qcseriald" C_RESET " v%s daemon starting (PID %d)\n", QCSERIALD_VERSION, getpid());
+    logprintf("Looking for supported modem (%zu vendors)...\n", NUM_VENDORS);
 
     pid_file_write(getpid());
 
@@ -1489,7 +1522,8 @@ static int cmd_start(int foreground) {
         dprintf(pipefd[1], "+" C_BOLD C_GREEN "qcseriald" C_RESET " started (PID %d)\n" C_YELLOW "No modem found — waiting for connection...\n" C_RESET, getpid());
         close(pipefd[1]);
 
-        printf(C_YELLOW "No modem found — entering rescan mode\n" C_RESET);
+        g_daemon_state = "waiting";
+        logprintf(C_YELLOW "No modem found — entering rescan mode\n" C_RESET);
     } else {
         /* Report initial ports to parent (names may still be -loading) */
         char msg[2048];
@@ -1502,24 +1536,24 @@ static int cmd_start(int foreground) {
         write(pipefd[1], msg, off);
         close(pipefd[1]);
 
-        printf("\n%d serial port(s) created — " C_GREEN "probing for port identification..." C_RESET "\n", g_bridge_count);
+        logprintf("\n%d serial port(s) created — " C_GREEN "probing for port identification..." C_RESET "\n", g_bridge_count);
 
         /* Probe unknown ports (may take up to 30s for RDY timeout) */
         probe_ports();
         g_daemon_state = "running";
 
-        printf("\n" C_BOLD "Final port assignment:" C_RESET "\n");
+        logprintf("\n" C_BOLD "Final port assignment:" C_RESET "\n");
         for (int i = 0; i < g_bridge_count; i++)
-            printf("  " C_GREEN "%s" C_RESET "\n", g_bridges[i].link_name);
+            logprintf("  " C_GREEN "%s" C_RESET "\n", g_bridges[i].link_name);
     }
 
     run_monitor_loop();
 
-    printf("Daemon shutting down...\n");
+    logprintf("Daemon shutting down...\n");
     shutdown_bridges();
     pid_file_remove();
     unlink(STATUS_FILE);
-    printf("Done\n");
+    logprintf("Done\n");
     _exit(0);
 }
 
