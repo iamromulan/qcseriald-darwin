@@ -42,7 +42,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.3"
+#define QCSERIALD_VERSION "1.0.4"
 #define QCSERIALD_AUTHOR  "iamromulan"
 #define QCSERIALD_URL     "https://github.com/iamromulan/qcseriald-darwin"
 
@@ -205,6 +205,7 @@ typedef struct {
 /* ── Globals ── */
 
 static _Atomic(int) g_running = 1;
+static const char *g_daemon_state = "starting";
 
 static bridge_t g_bridges[MAX_INTERFACES];
 static int g_bridge_count = 0;
@@ -359,6 +360,7 @@ static void *usb_to_pty(void *arg) {
     UInt8 buf[USB_BUF_SIZE];
     IOReturn kr;
     UInt32 len;
+    int not_responding_count = 0;
 
     atomic_store(&b->usb_to_pty_alive, 1);
     printf("[%s] USB->PTY thread started\n", b->func_name);
@@ -367,19 +369,28 @@ static void *usb_to_pty(void *arg) {
         len = sizeof(buf);
         kr = (*b->iface)->ReadPipe(b->iface, b->pipe_in, buf, &len);
         if (kr != kIOReturnSuccess) {
-            if (kr == kIOReturnAborted || kr == kIOReturnNotResponding) {
+            if (kr == kIOReturnAborted) {
                 printf("[%s] USB->PTY ReadPipe: 0x%x (stopping)\n", b->func_name, kr);
                 break;
             }
-            if (kr == (IOReturn)0xe00002eb) {  /* kIOUSBPipeStalled */
+            if (kr == kIOReturnNotResponding ||
+                kr == (IOReturn)0xe00002eb) {  /* kIOUSBPipeStalled */
+                /* Transient USB hiccup — clear stall and retry */
                 (*b->iface)->ClearPipeStall(b->iface, b->pipe_in);
-                usleep(100000);
+                not_responding_count++;
+                if (not_responding_count > 50) {  /* ~5s of continuous failure */
+                    printf("[%s] USB->PTY: device unresponsive after %d retries, giving up\n",
+                           b->func_name, not_responding_count);
+                    break;
+                }
+                usleep(100000);  /* 100ms */
                 continue;
             }
             fprintf(stderr, "[%s] USB->PTY ReadPipe error: 0x%x\n", b->func_name, kr);
             usleep(10000);
             continue;
         }
+        not_responding_count = 0;  /* Reset on successful read */
         if (len > 0) {
             ssize_t written = 0;
             while (written < (ssize_t)len) {
@@ -1212,6 +1223,7 @@ static void write_status_file(void) {
     if (!f) return;
 
     fprintf(f, "pid=%d\n", getpid());
+    fprintf(f, "state=%s\n", g_daemon_state);
     fprintf(f, "bridges=%d\n", g_bridge_count);
     for (int i = 0; i < g_bridge_count; i++) {
         bridge_t *b = &g_bridges[i];
@@ -1247,6 +1259,8 @@ static void run_monitor_loop(void) {
             if (g_bridge_count > prev_bridge_count)
                 prev_bridge_count = g_bridge_count;
             shutdown_bridges();
+            g_daemon_state = "waiting";
+            write_status_file();
 
             /* Enter rescan loop */
             printf(C_YELLOW "Waiting for modem to reconnect...\n" C_RESET);
@@ -1269,6 +1283,7 @@ static void run_monitor_loop(void) {
                         continue;
                     }
                     probe_ports();
+                    g_daemon_state = "running";
                     printf(C_GREEN "Modem reconnected — %d bridge(s) active\n" C_RESET, g_bridge_count);
                     prev_bridge_count = g_bridge_count;
                     printf("\n" C_BOLD "Active ports:" C_RESET "\n");
@@ -1376,8 +1391,10 @@ static int cmd_start(int foreground) {
 
         if (setup_bridges() < 0) {
             fprintf(stderr, C_YELLOW "No modem found — entering rescan mode\n" C_RESET);
+            g_daemon_state = "waiting";
         } else {
             probe_ports();
+            g_daemon_state = "running";
             printf("\n%d serial port(s) created:\n", g_bridge_count);
             for (int i = 0; i < g_bridge_count; i++)
                 printf("  %s\n", g_bridges[i].link_name);
@@ -1489,6 +1506,7 @@ static int cmd_start(int foreground) {
 
         /* Probe unknown ports (may take up to 30s for RDY timeout) */
         probe_ports();
+        g_daemon_state = "running";
 
         printf("\n" C_BOLD "Final port assignment:" C_RESET "\n");
         for (int i = 0; i < g_bridge_count; i++)
@@ -1568,7 +1586,13 @@ static int cmd_status(void) {
         size_t len = strlen(line);
         if (len > 0 && line[len - 1] == '\n') line[len - 1] = '\0';
 
-        if (strncmp(line, "bridges=", 8) == 0) {
+        if (strncmp(line, "state=", 6) == 0) {
+            const char *state = line + 6;
+            if (strcmp(state, "waiting") == 0)
+                printf("  " C_YELLOW "Waiting for modem to reconnect..." C_RESET "\n");
+            else if (strcmp(state, "starting") == 0)
+                printf("  " C_YELLOW "Starting up..." C_RESET "\n");
+        } else if (strncmp(line, "bridges=", 8) == 0) {
             printf("  " C_BOLD "Bridges:" C_RESET " %s\n", line + 8);
         } else if (strncmp(line, "port.", 5) == 0) {
             const char *color = strstr(line, "healthy") ? C_GREEN : C_RED;
