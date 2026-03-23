@@ -43,7 +43,7 @@
 
 /* ── Version ── */
 
-#define QCSERIALD_VERSION "1.0.5"
+#define QCSERIALD_VERSION "1.0.6"
 #define QCSERIALD_AUTHOR  "iamromulan"
 #define QCSERIALD_URL     "https://github.com/iamromulan/qcseriald-darwin"
 
@@ -266,6 +266,8 @@ static char g_edl_product[128];      /* product name of EDL device */
 static bridge_t g_bridges[MAX_INTERFACES];
 static int g_bridge_count = 0;
 static int g_expected_bridges = 0;  /* vendor-specific interfaces found (minus ADB) */
+static int g_matched_vid = 0;        /* VID of connected modem */
+static uint64_t g_session_id = 0;    /* IOKit sessionID — changes on USB re-enumeration */
 
 static pthread_mutex_t g_exit_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_exit_cond  = PTHREAD_COND_INITIALIZER;
@@ -412,6 +414,20 @@ static void cleanup_stale_symlinks(void) {
 
 /* ── Thread: USB bulk IN → PTY master ── */
 
+static int pty_slave_is_open(int master_fd)
+{
+    /*
+     * Detect if any process has the PTY slave open.
+     * macOS quirk: poll(POLLHUP) doesn't work reliably for PTYs
+     * whose slave was never opened externally.  write(fd,"",0)
+     * returns EIO when no slave is open, 0 when one is.
+     */
+    ssize_t ret = write(master_fd, "", 0);
+    if (ret < 0 && errno == EIO)
+        return 0;
+    return 1;
+}
+
 static void *usb_to_pty(void *arg) {
     bridge_t *b = (bridge_t *)arg;
     UInt8 buf[USB_BUF_SIZE];
@@ -425,6 +441,18 @@ static void *usb_to_pty(void *arg) {
     logprintf("[%s] USB->PTY thread started\n", b->func_name);
 
     while (atomic_load(&g_running) && atomic_load(&b->state) == BRIDGE_RUNNING) {
+        /*
+         * Demand-driven: only read from USB when a client has the
+         * PTY slave open.  This eliminates bulk IN NAK traffic on
+         * idle endpoints, matching Linux usb_wwan behavior where
+         * URBs are only submitted for ports with active TTY sessions.
+         */
+        if (!pty_slave_is_open(b->pty_master)) {
+            usleep(100000);  /* 100ms */
+            last_good_read = time(NULL);
+            continue;
+        }
+
         len = sizeof(buf);
         kr = (*b->iface)->ReadPipe(b->iface, b->pipe_in, buf, &len);
         if (kr != kIOReturnSuccess) {
@@ -701,6 +729,17 @@ static int setup_bridges(void) {
     }
 
     logprintf("Matched vendor: %s (VID 0x%04x PID 0x%04x)\n", matched_vendor, matched_vid, matched_pid);
+    g_matched_vid = matched_vid;
+
+    /* Store sessionID for re-enumeration detection in monitor */
+    CFNumberRef sessionRef = IORegistryEntryCreateCFProperty(device,
+        CFSTR("sessionID"), kCFAllocatorDefault, 0);
+    if (sessionRef) {
+        long long sid = 0;
+        CFNumberGetValue(sessionRef, kCFNumberLongLongType, &sid);
+        g_session_id = (uint64_t)sid;
+        CFRelease(sessionRef);
+    }
 
     /* Get product name */
     CFStringRef product = IORegistryEntryCreateCFProperty(device, CFSTR("USB Product Name"),
@@ -783,6 +822,15 @@ static int setup_bridges(void) {
             continue;
         }
 
+        /* Skip QMI/RmNet interface (subclass 0xFF, protocol 0xFF).
+         * QMI is a binary modem control protocol, not serial data.
+         * Distinct from DIAG which is 0xFF/0xFF/0x30. */
+        if (iface_subclass == 0xFF && iface_protocol == 0xFF) {
+            logprintf("Skipping QMI/RmNet interface %d\n", iface_num);
+            (*iface)->Release(iface);
+            continue;
+        }
+
         iface_count++;
         kr = (*iface)->USBInterfaceOpen(iface);
         if (kr != kIOReturnSuccess) {
@@ -835,10 +883,13 @@ static int setup_bridges(void) {
         tcsetattr(master, TCSANOW, &tio);
 
         /* Make PTY slave accessible to non-root users.
-         * Keep slave fd open — if we close it, writes to the master return EIO
-         * and any modem data (including RDY URC) arriving before probe_ports()
-         * opens the slave would be silently discarded. */
+         * Close slave fd so pty_slave_is_open() can detect when no
+         * external client has the slave open (write returns EIO).
+         * The PTY pair stays valid as long as the master fd is open;
+         * external processes can still open the slave via the symlink. */
         chmod(slave_name, 0666);
+        close(slave);
+        slave = -1;
 
         /* Determine port name:
          * 1. DIAG: protocol 0x30, OR VID/PID table match on interface number
@@ -1426,18 +1477,59 @@ static void run_monitor_loop(void) {
     int prev_bridge_count = 0;  /* remember how many bridges we had before disconnect */
 
     while (atomic_load(&g_running)) {
-        /* Health check — USB→PTY thread death means modem disconnected.
-         * PTY→USB threads stay alive (waiting for slave data) so we only
-         * check usb_to_pty_alive for disconnect detection. */
+        /* Health check — two methods:
+         * 1. Thread death (any thread, not just all)
+         * 2. IOKit sessionID — detects modem reboot / USB
+         *    re-enumeration even when threads are idle.
+         *    Pure IOKit registry query, zero USB traffic. */
         int alive_count = 0;
         for (int i = 0; i < g_bridge_count; i++) {
             if (atomic_load(&g_bridges[i].usb_to_pty_alive))
                 alive_count++;
         }
 
+        int device_ok = 1;
+        if (g_bridge_count > 0 && g_matched_vid) {
+            device_ok = 0;
+            io_iterator_t iter;
+            kern_return_t kr = IOServiceGetMatchingServices(
+                kIOMainPortDefault,
+                IOServiceMatching("IOUSBHostDevice"), &iter);
+            if (kr == KERN_SUCCESS) {
+                io_service_t dev;
+                while ((dev = IOIteratorNext(iter))) {
+                    CFNumberRef vidRef = IORegistryEntryCreateCFProperty(
+                        dev, CFSTR("idVendor"),
+                        kCFAllocatorDefault, 0);
+                    if (vidRef) {
+                        int vid = 0;
+                        CFNumberGetValue(vidRef, kCFNumberIntType, &vid);
+                        CFRelease(vidRef);
+                        if (vid == g_matched_vid) {
+                            CFNumberRef sidRef = IORegistryEntryCreateCFProperty(
+                                dev, CFSTR("sessionID"),
+                                kCFAllocatorDefault, 0);
+                            if (sidRef) {
+                                long long sid = 0;
+                                CFNumberGetValue(sidRef,
+                                    kCFNumberLongLongType, &sid);
+                                CFRelease(sidRef);
+                                if ((uint64_t)sid == g_session_id)
+                                    device_ok = 1;
+                            }
+                        }
+                    }
+                    IOObjectRelease(dev);
+                    if (device_ok) break;
+                }
+                IOObjectRelease(iter);
+            }
+        }
+
         write_status_file();
 
-        if (g_bridge_count > 0 && alive_count == 0) {
+        if (g_bridge_count > 0 &&
+            (alive_count < g_bridge_count || !device_ok)) {
             logprintf(C_YELLOW "All bridges dead — modem likely disconnected\n" C_RESET);
             if (g_bridge_count > prev_bridge_count)
                 prev_bridge_count = g_bridge_count;
@@ -1453,6 +1545,7 @@ static void run_monitor_loop(void) {
              * Periodically try to discover the modem. */
             logprintf(C_YELLOW "Waiting for modem...\n" C_RESET);
             int retries_with_partial = 0;
+            prev_bridge_count = 0;  /* next modem may have different interface count */
             while (atomic_load(&g_running)) {
                 for (int s = 0; s < RESCAN_INTERVAL && atomic_load(&g_running); s++)
                     sleep(1);
