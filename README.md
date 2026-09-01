@@ -102,6 +102,40 @@ screen /dev/tty.qcserial-at0 115200
 # Response: OK
 ```
 
+### Selecting a modem when several are attached
+
+By default the daemon bridges the **first** supported modem IOKit enumerates and
+ignores the rest. IOKit's enumeration order is not stable across reboots or
+replugs, so when more than one supported modem is connected you should say which
+one to bind:
+
+```bash
+# Bind a specific model by USB VID:PID (hex; the PID may be omitted to match any
+# product of that vendor):
+sudo ./qcseriald start --match 2c7c:0801
+sudo ./qcseriald start --match 1199        # any Sierra Wireless modem
+
+# Bind a specific physical unit by its USB serial (exact, case-insensitive).
+# Use this to disambiguate two units of the *same* model, which share an
+# identical VID:PID and differ only by serial:
+sudo ./qcseriald start --serial 8ac024e6
+
+# Combine them to break ties within a model:
+sudo ./qcseriald start --match 1bc7:1040 --serial 4f541b8a
+```
+
+With no selector, behavior is unchanged (first match wins). If a selector is set
+but no attached modem matches it, the daemon logs the unmet selector once and
+keeps retrying rather than silently grabbing an unrelated modem. The startup
+banner and daemon log print the bound unit's serial on the `Matched vendor …`
+line, so you can confirm which physical modem was selected.
+
+Environment fallbacks `QCSERIALD_MATCH` (a `VID:PID`) and
+`QCSERIALD_MATCH_SERIAL` fill in any selector field a flag didn't set. **The
+command-line flags are the `sudo`-safe path:** `sudo` strips unknown environment
+variables, so a `QCSERIALD_MATCH*` env var only survives if your sudoers config
+`env_keep`s it — prefer `--match`/`--serial` unless you control sudoers.
+
 ## How It Works
 
 ```
