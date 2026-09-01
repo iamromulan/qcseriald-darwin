@@ -59,6 +59,19 @@
 
 static int g_log_timestamps;  /* set to 1 when running as daemon */
 
+/* ── Device selection ── */
+/* When more than one supported modem is attached, choose WHICH one to bridge.
+ * Unset (all -1 / empty) ⇒ today's first-supported-VID-wins behavior, byte-for-
+ * byte. Set via `--match <vid>:<pid>` and/or `--serial <str>` on start/restart
+ * (sudo-safe as argv), with env fallback QCSERIALD_MATCH / QCSERIALD_MATCH_SERIAL
+ * (env needs a sudoers env_keep entry to survive `sudo`). Parsed once before the
+ * daemonize fork; the child inherits these and setup_bridges() re-reads them on
+ * every hotplug rescan. */
+static int  g_match_vid = -1;          /* selected idVendor,  -1 = any */
+static int  g_match_pid = -1;          /* selected idProduct, -1 = any */
+static char g_match_serial[64] = "";   /* selected USB iSerialNumber, "" = any */
+static int  g_logged_no_match = 0;     /* throttle the "no device matched" log */
+
 __attribute__((format(printf, 1, 2)))
 static void logprintf(const char *fmt, ...) {
     if (g_log_timestamps) {
@@ -654,6 +667,32 @@ static int attempt_usb_recovery(io_service_t device_service) {
 
 /* ── Setup: find USB device and open interfaces ── */
 
+/* Read a device's USB serial string into out (empty on failure). Mirrors the
+ * existing "USB Product Name" read style. */
+static void read_usb_serial(io_service_t dev, char *out, size_t outlen) {
+    out[0] = '\0';
+    CFStringRef s = IORegistryEntryCreateCFProperty(dev, CFSTR("USB Serial Number"),
+                                                    kCFAllocatorDefault, 0);
+    if (s) {
+        CFStringGetCString(s, out, outlen, kCFStringEncodingUTF8);
+        CFRelease(s);
+    }
+}
+
+/* True when a device selector is active (any of --match vid/pid, --serial). */
+static int selector_active(void) {
+    return g_match_vid >= 0 || g_match_pid >= 0 || g_match_serial[0] != '\0';
+}
+
+/* True when (vid,pid,serial) satisfies the active selector. Unset selector
+ * fields match anything; serial compare is case-insensitive exact. */
+static int device_matches_selector(int vid, int pid, const char *serial) {
+    if (g_match_vid >= 0 && vid != g_match_vid) return 0;
+    if (g_match_pid >= 0 && pid != g_match_pid) return 0;
+    if (g_match_serial[0] && strcasecmp(serial, g_match_serial) != 0) return 0;
+    return 1;
+}
+
 static int setup_bridges(void) {
     g_edl_detected = 0;
     g_edl_product[0] = '\0';
@@ -716,6 +755,18 @@ static int setup_bridges(void) {
                     matched_vendor = NULL;
                     continue;
                 }
+                /* Device selection: when a selector is active, skip any
+                 * supported, non-EDL candidate that doesn't match it and keep
+                 * scanning. Unset selector ⇒ first-match wins, as before. */
+                if (selector_active()) {
+                    char serial[64];
+                    read_usb_serial(candidate, serial, sizeof(serial));
+                    if (!device_matches_selector(vid, matched_pid, serial)) {
+                        IOObjectRelease(candidate);
+                        matched_vendor = NULL;
+                        continue;
+                    }
+                }
                 device = candidate;
                 break;
             }
@@ -725,10 +776,36 @@ static int setup_bridges(void) {
     IOObjectRelease(dev_iter);
 
     if (!device) {
+        /* Selector active but nothing matched: say so ONCE (setup_bridges runs
+         * every rescan, ~5s) so the retry loop isn't silent and we don't quietly
+         * grab an unrelated modem. Re-armed on the next successful match. */
+        if (selector_active() && !g_logged_no_match) {
+            char want[96];
+            int n = 0;
+            if (g_match_vid >= 0 || g_match_pid >= 0)
+                n += snprintf(want + n, sizeof(want) - n, "vid:pid=%04x:%04x",
+                              g_match_vid < 0 ? 0 : g_match_vid,
+                              g_match_pid < 0 ? 0 : g_match_pid);
+            if (g_match_serial[0])
+                snprintf(want + n, sizeof(want) - n, "%sserial=%s",
+                         n ? " " : "", g_match_serial);
+            logprintf("No device matched selector (%s) — will keep retrying\n", want);
+            g_logged_no_match = 1;
+        }
         return -1;  /* No modem found — caller will retry */
     }
+    g_logged_no_match = 0;  /* re-arm the no-match log for future rescans */
 
-    logprintf("Matched vendor: %s (VID 0x%04x PID 0x%04x)\n", matched_vendor, matched_vid, matched_pid);
+    /* Log the bound unit's USB serial too: on hosts with two modems that share
+     * an identical VID:PID (e.g. two LM960A18-CP at 0x1bc7:0x1040) the vendor/VID/
+     * PID/product lines are identical, so the serial is the only field that
+     * identifies which physical unit was bound. Read unconditionally (not only
+     * under a --serial selector); "-" when the device exposes no serial. */
+    char bound_serial[64];
+    read_usb_serial(device, bound_serial, sizeof(bound_serial));
+    logprintf("Matched vendor: %s (VID 0x%04x PID 0x%04x serial %s)\n",
+              matched_vendor, matched_vid, matched_pid,
+              bound_serial[0] ? bound_serial : "-");
     g_matched_vid = matched_vid;
 
     /* Store sessionID for re-enumeration detection in monitor */
@@ -2031,6 +2108,79 @@ static void usage(void) {
     fprintf(stderr, "  " C_GREEN "log" C_RESET "                Print daemon log (%s)\n", LOG_FILE);
     fprintf(stderr, "  " C_GREEN "log -f" C_RESET "             Follow daemon log (tail -f)\n");
     fprintf(stderr, "  " C_GREEN "version" C_RESET "            Show version and fenix art\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, C_BOLD "start / restart options:" C_RESET "\n");
+    fprintf(stderr, "  " C_GREEN "-f, --foreground" C_RESET "   Run in foreground (for launchd)\n");
+    fprintf(stderr, "  " C_GREEN "--match VID:PID" C_RESET "    Bind only this modem (hex, e.g. 2c7c:0801) when\n");
+    fprintf(stderr, "                     several supported modems are attached. Either field\n");
+    fprintf(stderr, "                     may be omitted (2c7c: = any Quectel PID).\n");
+    fprintf(stderr, "  " C_GREEN "--serial STR" C_RESET "       Bind only the modem with this USB serial (exact,\n");
+    fprintf(stderr, "                     case-insensitive); combine with --match to break ties.\n");
+    fprintf(stderr, "                     Env fallback: QCSERIALD_MATCH, QCSERIALD_MATCH_SERIAL\n");
+    fprintf(stderr, "                     (env needs sudoers env_keep to survive sudo).\n");
+}
+
+/* Parse a device-selection spec "<vid>[:<pid>]" (hex) into g_match_vid /
+ * g_match_pid. Absent or invalid fields stay -1 (= match any). */
+static void parse_match_spec(const char *spec) {
+    if (!spec || !*spec) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char *colon = strchr(buf, ':');
+    if (colon) *colon = '\0';
+    if (buf[0]) {
+        char *end = NULL;
+        long v = strtol(buf, &end, 16);
+        if (*end == '\0' && v >= 0 && v <= 0xffff) g_match_vid = (int)v;
+        else fprintf(stderr, C_YELLOW "Ignoring bad --match VID: %s\n" C_RESET, buf);
+    }
+    if (colon && colon[1]) {
+        char *end = NULL;
+        long p = strtol(colon + 1, &end, 16);
+        if (*end == '\0' && p >= 0 && p <= 0xffff) g_match_pid = (int)p;
+        else fprintf(stderr, C_YELLOW "Ignoring bad --match PID: %s\n" C_RESET, colon + 1);
+    }
+}
+
+/* Env fallback for device selection: fills any selector field the flags left
+ * unset. QCSERIALD_MATCH="vid:pid", QCSERIALD_MATCH_SERIAL="serial". Env is
+ * stripped by `sudo` unless whitelisted in sudoers env_keep — the flags are the
+ * sudo-safe path. */
+static void apply_selector_env(void) {
+    const char *m = getenv("QCSERIALD_MATCH");
+    if (m && *m && g_match_vid < 0 && g_match_pid < 0)
+        parse_match_spec(m);
+    const char *s = getenv("QCSERIALD_MATCH_SERIAL");
+    if (s && *s && g_match_serial[0] == '\0')
+        snprintf(g_match_serial, sizeof(g_match_serial), "%s", s);
+}
+
+/* Parse start/restart options starting at argv[from]. Sets *foreground and the
+ * device-selection globals (g_match_vid/pid/serial). */
+static void parse_start_opts(int argc, char **argv, int from, int *foreground) {
+    for (int i = from; i < argc; i++) {
+        if (strcmp(argv[i], "--foreground") == 0 || strcmp(argv[i], "-f") == 0) {
+            *foreground = 1;
+        } else if (strncmp(argv[i], "--match=", 8) == 0) {
+            parse_match_spec(argv[i] + 8);
+        } else if (strcmp(argv[i], "--match") == 0) {
+            if (i + 1 < argc)
+                parse_match_spec(argv[++i]);
+            else
+                fprintf(stderr, C_YELLOW "--match requires a VID:PID argument\n" C_RESET);
+        } else if (strncmp(argv[i], "--serial=", 9) == 0) {
+            snprintf(g_match_serial, sizeof(g_match_serial), "%s", argv[i] + 9);
+        } else if (strcmp(argv[i], "--serial") == 0) {
+            if (i + 1 < argc)
+                snprintf(g_match_serial, sizeof(g_match_serial), "%s", argv[++i]);
+            else
+                fprintf(stderr, C_YELLOW "--serial requires a STRING argument\n" C_RESET);
+        } else {
+            fprintf(stderr, C_YELLOW "Ignoring unknown start option: %s\n" C_RESET, argv[i]);
+        }
+    }
+    /* Env fallback fills any selector field the flags didn't set. */
+    apply_selector_env();
 }
 
 /* ── Main ── */
@@ -2046,8 +2196,7 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "start") == 0) {
         int foreground = 0;
-        if (argc >= 3 && strcmp(argv[2], "--foreground") == 0)
-            foreground = 1;
+        parse_start_opts(argc, argv, 2, &foreground);
         return cmd_start(foreground);
     } else if (strcmp(argv[1], "stop") == 0) {
         return cmd_stop();
@@ -2056,8 +2205,7 @@ int main(int argc, char **argv) {
             return 1;
         cmd_stop();
         int foreground = 0;
-        if (argc >= 3 && strcmp(argv[2], "--foreground") == 0)
-            foreground = 1;
+        parse_start_opts(argc, argv, 2, &foreground);
         return cmd_start(foreground);
     } else if (strcmp(argv[1], "status") == 0) {
         return cmd_status();
