@@ -13,6 +13,7 @@ By [iamromulan](https://github.com/iamromulan) | Part of the [qfenix](https://gi
 ## Features
 
 - **Automatic port identification** — DIAG, AT, NMEA, and GPS ports detected and named automatically
+- **QMI passthrough (opt-in)** — exposes a modem's QMI (UIM) channel as a frame-preserving unix socket so on-macOS LPA tooling can talk QMUX without libqmi or the Linux `cdc-wdm`/`qmi_wwan` kernel drivers ([details](#qmi-passthrough-opt-in))
 - **Auto-reconnect** — modem unplug/replug handled seamlessly with ~7s disconnect detection
 - **EDL mode awareness** — detects when modem enters EDL (Emergency Download) mode and reports it in status without blocking [qfenix](https://github.com/iamromulan/qfenix) libusb access
 - **Stale instance cleanup** — kills zombie processes from previous sessions on start (prevents exclusive access lock-ups)
@@ -52,6 +53,12 @@ Tested with **Quectel RM551E-GL** (VID 0x2c7c, PID 0x0122). Additional vendors c
 | `/dev/tty.qcserial-at1` | AT command port (auto-detected via AT probe) |
 
 ADB interfaces are automatically skipped and left available for `adb` to use directly.
+
+When QMI passthrough is enabled (see [below](#qmi-passthrough-opt-in)), the modem's QMI interface is additionally exposed as a **unix socket**, not a serial port:
+
+| Endpoint | Function |
+|------|----------|
+| `tty.qcserial-qmi.sock` | QMI (UIM) channel — a frame-preserving QMUX passthrough (unix stream socket, not a PTY) |
 
 ## Requirements
 
@@ -192,6 +199,57 @@ If the daemon is killed uncleanly (`kill -9`), or leftover processes exist from 
 ### ADB Coexistence
 
 The daemon does not take device-level USB access, so ADB works simultaneously. It also automatically sets `ADB_LIBUSB=0` system-wide to work around an ADB bug with non-contiguous USB interface numbers.
+
+## QMI Passthrough (opt-in)
+
+Beyond the serial (DIAG/AT/NMEA/GPS) ports, the daemon can expose a modem's **QMI (UIM) channel** so a pure-userspace LPA can drive the eUICC on macOS with **no libqmi and no Linux `cdc-wdm` / `qmi_wwan` kernel drivers**.
+
+QMI is a message-framed binary protocol (QMUX), not a serial byte stream, so it is *not* bridged to a PTY. Instead the daemon presents it as a **frame-preserving unix stream socket**: one socket write carries one whole QMUX frame, and the daemon reassembles the client's byte stream into whole frames before each control transfer to the modem.
+
+The feature is **opt-in and off by default** — without it, nothing about normal operation changes and the QMI interface is simply skipped as before.
+
+### Enabling it
+
+Set the environment variable before starting the daemon:
+
+```bash
+sudo QCSERIALD_QMI_SOCKET=1 ./qcseriald start --foreground
+```
+
+When enabled, an identified QMI interface is exposed at:
+
+```
+<symlink-dir>/tty.qcserial-qmi.sock
+```
+
+`<symlink-dir>` is normally the same directory the serial ports use — `/dev/` when writable, otherwise the `~/dev/` SIP fallback (see [SIP and `/dev/` Symlinks](#sip-system-integrity-protection-and-dev-symlinks)). The socket directory is resolved by an *actual* `bind()`, not by the symlink probe: `/dev/` is devfs, a synthetic filesystem that need not support `AF_UNIX` socket inodes, and the symlink probe never tested that capability. If the bind there fails, the daemon falls back to the `~/dev/` real-filesystem directory **for the socket alone**. The socket and the serial symlinks may then live in different directories — the startup banner and the daemon log always print the socket's actual path, so point your LPA/QMI client at whichever path they report.
+
+`tools/qmi_sock_probe.py` does a single read-only CTL round-trip against the socket to confirm the transport end to end.
+
+### Environment variables
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `QCSERIALD_QMI_SOCKET` | *(unset → off)* | Set to `1` (or `yes`/`true`) to expose the QMI socket. Off by default; no socket is created unless set. |
+| `QCSERIALD_QMI_DTR` | `0x0003` (DTR\|RTS) | Overrides the CDC `SET_CONTROL_LINE_STATE` value asserted on the QMI interface. Some modems (e.g. Fibocom FM101-GL) emit no `RESPONSE_AVAILABLE` notifications until DTR/RTS is asserted; others (e.g. Telit LM960A18) do not need it. Accepts hex (`0x..`) or decimal; `off` or `no` skips the request entirely, and `0` still sends it with both lines cleared. |
+
+### Interface detection
+
+Enabling the socket does not change which interfaces are recognized as QMI. The QMI/RmNet skip matches subclass `0xFF` with protocol `0xFF` **or** `0x50`, and that applies whether or not the socket is enabled — a `0xFF/0xFF/0x50` interface (the `qmi_wwan` channel on parts such as the FM101-GL) is treated as the QMI/RmNet channel it is, rather than being bridged to a PTY and AT-probed as if it were a serial port.
+
+A few modems expose **more than one** `0xFF` interface with an interrupt-IN endpoint, only one of which is the real cdc-wdm QMI control function — the Sierra MC7700 is the tested example (interface 3 is an AT port, interface 8 is QMI). Two small per-VID/PID tables in `qcseriald.c` disambiguate those declaratively: `qmi_iface_maps[]` pins the QMI control interface, and `serial_iface_maps[]` exempts the sibling functions from the QMI/RmNet skip so they surface as ordinary AT/NMEA ports. Modems listed in neither table keep the default first-match selection unchanged.
+
+### Socket semantics
+
+- **Frame-preserving:** one write ≈ one QMUX frame (`0x01 | len:u16 LE | flags | service | client | SDU…`). The daemon reassembles partial/coalesced reads into whole frames, so a client may write frames back-to-back.
+- **Single client by design:** a new connection replaces any existing one — there is no concurrent-client multiplexing. A client that stops reading its replies is dropped rather than allowed to stall the QMI path.
+- **Requires an interrupt-IN endpoint:** the QMUX control path is gated on the modem's `RESPONSE_AVAILABLE` interrupt notification. A QMI function without an interrupt-IN endpoint is unsupported and logged as such (no socket is created). A bounded `GET_ENCAPSULATED_RESPONSE` poll backs the interrupt up when it does not arrive; `qcseriald status` counts those separately as `qmi_polls`.
+- **Honest health:** when the channel accepts commands but never answers, `status` reports the bridge as `degraded` rather than `healthy`.
+- **World-accessible:** the socket is created mode `0666` so a non-root client can connect, mirroring the PTY permissions. Note this is a more privileged channel than a serial port — any local user that can reach the socket can issue QMI requests to the modem. It is off by default.
+
+### Supported / tested surface
+
+QMI passthrough has been verified live on ten Qualcomm cdc-wdm parts across five vendors (Telit, Fibocom, Quectel, Sierra, SIMCom). The detection and addressing generalize in principle but are unproven beyond those parts, and some parts present a correct-looking QMI interface yet never answer on macOS. See [**QMI scope & limitations**](docs/qmi-scope-and-limitations.md) for the full tested-modem matrix, the known-silent parts, and the verification status of each failure path.
 
 ## Install (system-wide)
 
